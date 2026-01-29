@@ -20,6 +20,128 @@ Define initial conditions and parameters
 2. Define initial params, control volume parameters
 3. Functions to create mass and energy balance models for indoor environment
 '''
+'''
+# Function to estimate pollutant concentration without filter
+# Define symbolic variables
+'''
+t = sp.symbols('t')
+Cin = sp.Function('Cin')(t)
+initial_c, ach, emi_pm, dr = sp.symbols('initial_c ach emi_pm dr')
+# Define the differential equation
+# ach(/h), ir(ug/s), V(m^3), emi_pm(ug/s), gamma(/s), Cin(ug/m3), t(s)
+eqn = sp.Eq(sp.Derivative(Cin, t), (ir * ach) / (V * 0.5) - (Cin * ach / 3600) + (emi_pm / V) - (dr * Cin))
+# Define the initial condition
+initial_condition = {Cin.subs(t, 0): initial_c}
+# Solve the differential equation with the initial condition
+solution = sp.dsolve(eqn, ics=initial_condition)
+C_indoor = solution.rhs                                      # Indoor conc in ug/m^3
+
+'''
+# Function to estimate air parameters
+# T(Celsius), RH(%)
+'''
+def air_parameters(T, RH):
+  sat_press = (np.exp(34.494 - (4924.99 / (T+ 237.1)))) / (T + 105) ** 1.57   # Saturation vapour pressure of indoor air at any time (in Pascal)
+  vap_press = RH * sat_press/ 100    # Vapour pressure of indoor air at any time (in Pascal)
+  w = 621.9907 * vap_press/ P_atm   # Fraction of water in indoor air at any time t (in kg H2O/kg of air)
+  mixratio = 621.9907 * vap_press / (P_atm - vap_press) # Mixratio of indoor air at any time (gm H2O/kg dry air)
+  h= T* (1.01 + 0.00189 * mixratio) + 2.5 * mixratio    # Enthalpy of indoor air at any time (kJ/kg)
+  return sat_press, vap_press, w, mixratio, h
+
+'''
+# Estimate power consumption in Watts
+# ach_dvs(/h), ach_hvac(/h), h_net(kJ/kg), h_hv(kJ/kg), power(Watts)
+# Input: ACH of DVS and HVAC, Enthaply of mixed air at t-1, Enthalpy of supply air at t
+# Output: HVAC, DVS, and Total Power Consumption
+'''
+def power_consumption(achdvs,achhvac,h_net_prev,h_hv_current):
+  q_hvac = achhvac * V / 3600              # m^3/s
+  q_dvs = achdvs * V / 3600                # m^3/s
+  power_hv = (1000 * (((q_hvac + q_dvs) * rho_air * (h_net_prev - h_hv_current)) / (EER)) \
+                            + dP_dvs * (q_hvac + q_dvs) / eff_dvs)                      
+  power_dvs = (dP_dvs * achdvs * V / (3600 * eff_dvs))                                 
+  power_tot = (power_hv + power_dvs)                                                    
+  return power_hv, power_dvs, power_tot
+
+'''
+# Function for estimating mixed air (dvs air and indoor air being sent to HVAC)
+# Returns air properties of mixed air (dvs+indoor)
+'''
+def mixed_air(achdvs,achhvac,hout,hin,win,wout):
+  q_hvac = achhvac * V / 3600               # m^3/s
+  q_dvs = achdvs * V / 3600                 # m^3/s
+  h_mixed = (q_dvs * tstep * 60 * hout + q_hvac * tstep * 60 * hin)/ ((q_dvs + q_hvac) * tstep * 60)     # (in kJ/kg)
+  w_mixed = (tstep * 60 * q_hvac * win + tstep * 60 * q_dvs * wout) / ((q_dvs + q_hvac) * tstep * 60)    # (in kg H2O/kg of air)
+  vap_press_mixed = w_mixed * P_atm / 621.9907                                                           # (in Pascal)
+  mixratio_mixed = 621.9907 * vap_press_mixed / (P_atm - vap_press_mixed)                                # (gm H2O/kg dry air)
+  temp_mixed = (h_mixed - 2.5 * mixratio_mixed)/ (1.01 + 0.00189 * mixratio_mixed)                       # in Celsius
+  sat_press_mixed = (np.exp(34.494 - (4924.99 / (temp_mixed + 237.1)))) / (temp_mixed + 105) ** 1.57     # (in Pascal)
+  rh_mixed = 100 * vap_press_mixed / sat_press_mixed                                                     # in %
+  return h_mixed, w_mixed, vap_press_mixed, mixratio_mixed, temp_mixed, sat_press_mixed, rh_mixed
+
+'''
+# HVAC Operation based on indoor air temperature and mixed air cooling only (no consideration of Power)
+# Input: Mixed air temp and RH at any time, Indoor temp at any time
+# Output: Supply air temp properties at next time
+'''
+def hvac_operation(temp_net,temp_in,rh_net):
+  if (temp_net - 10 < 15):        # mixed air temp at t
+        temp_hv = 15              # Temp of HVAC air at t+1
+  else:
+        temp_hv = temp_net - 10    # Temp of HVAC air at t+1
+  if (temp_in >= T_set + 0.5):    # Indoor temp at t >=Set Temp+0.5
+        rh_hv = RH_hvac
+        sat_press_hv,vap_press_hv,w_hv,mixratio_hv,h_hv=air_parameters(temp_hv,rh_hv)
+  else:
+        temp_hv = temp_net
+        rh_hv = rh_net
+        sat_press_hv,vap_press_hv,w_hv,mixratio_hv,h_hv=air_parameters(temp_hv, rh_hv)
+  return temp_hv, rh_hv, sat_press_hv, vap_press_hv, w_hv, mixratio_hv, h_hv
+
+'''
+Air properties at next time (t+1)
+'''
+def air_properties_next_time(achdvs,achhvac,w_hv,win_prev,h_hv,hin_prev,Tout_prev,Tin_prev):
+  # Calculate w_bm for next time step
+  q_hvac = achhvac * V / 3600
+  q_dvs = achdvs * V / 3600
+  win = win_prev + ((tstep * 60 * (q_hvac + q_dvs) * rho_air * (w_hv - win_prev)) / (V * rho_air))     # (in kg H2O/kg of air)
+  vap_pressin = win * P_atm / 621.9907                                                                 # Pascals    
+  hin = ((q_hvac + q_dvs) * tstep * 60 * h_hv/ V) + \
+            ((V - (q_hvac + q_dvs) * tstep * 60) * hin_prev/ V) + \
+            (alpha * tstep * 60 * (Tout_prev - Tin_prev) / (V * rho_air))                              # kJ/kg
+  mixratioin = 621.9907 * vap_pressin / (P_atm - vap_pressin)                                          # (gm H2O/kg dry air)
+  Tin = (hin - 2.5 * mixratioin) / (1.01 + 0.00189 * mixratioin)                                       # Celsius
+  sat_pressin = (np.exp(34.494 - (4924.99 / (Tin + 237.1)))) / (Tin + 105) ** 1.57                    # Pascals
+  RHin = 100 * vap_pressin / sat_pressin                                                              # %
+
+  return win,vap_pressin,hin,mixratioin,Tin,sat_pressin,RHin
+    
+'''
+Update supply air parameters if HVAC Power is more than Max HVAC Power
+'''
+def update_parameters(achdvs,achhvac,Power_hv,h_mixed):
+  q_hvac = achhvac * V / 3600
+  q_dvs = achdvs * V / 3600
+  Power_hv = Max_power_hvac
+  h_hv = h_mixed - (Power_hv - dP_dvs * (q_hvac + q_dvs) / eff_dvs) * EER / (1000 * (q_hvac + q_dvs) * rho_air)
+  # Define the symbolic variable T
+  T = sp.symbols('T')
+  # Define the expressions
+  var = (621.9907 * RH_hvac * (sp.exp(34.494 - (4924.99 / (T + 237.1)))) / (100 * (T + 105) ** 1.57))
+  var1 = ((RH_hvac * sp.exp(34.494 - 4924.99 / (T + 237.1))) / (100 * (T + 105) ** 1.57))
+  h = T * (1.01 + 0.00189 * var / (P_atm - var1)) + 2.5 * var / (P_atm - var1)
+  # Define the equation to solve
+  eqn = h_hv - h
+  # Convert the equation to a callable function
+  eqn_func = sp.lambdify(T, eqn)
+  # Solve the equation using fsolve
+  initial_guess = 25  # Initial guess for T
+  T_solution = fsolve(eqn_func, initial_guess)[0]
+  # Update T_hvac for the next time step
+  temp_hv = T_solution
+  sat_press_hv,vap_press_hv,w_hv,mixratio_hv,h_hv=air_parameters(temp_hv,RH_hvac)
+  return temp_hv, sat_press_hv, vap_press_hv, w_hv, mixratio_hv, h_hv, Power_hv
 
 """
 Create a separate Python environment and install all dependencies such as 
@@ -364,3 +486,4 @@ for i, combination in enumerate(combinations):
     # # Save the results to a CSV file
     results_df.to_csv(f"W1_W2_1by10_DDQN_Tuning_Combination_Uncertainty_meanQaction_{i+1}.csv", index=False)
     print(f'Results saved')
+
